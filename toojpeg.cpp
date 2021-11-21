@@ -6,6 +6,10 @@
 
 #include "toojpeg.h"
 
+#include <functional>
+
+#include <QFile>
+
 // - the "official" specifications: https://www.w3.org/Graphics/JPEG/itu-t81.pdf and https://www.w3.org/Graphics/JPEG/jfif3.pdf
 // - Wikipedia has a short description of the JFIF/JPEG file format: https://en.wikipedia.org/wiki/JPEG_File_Interchange_Format
 // - the popular STB Image library includes Jon's JPEG encoder as well: https://github.com/nothings/stb/blob/master/stb_image_write.h
@@ -94,6 +98,9 @@ const int16_t CodeWordLimit = 2048; // +/-2^11, maximum value after DCT
 // ////////////////////////////////////////
 // structs
 
+// write one byte (to disk, memory, ...)
+typedef std::function<void(unsigned char)> WRITE_ONE_BYTE;
+
 // represent a single Huffman code
 struct BitCode
 {
@@ -108,9 +115,9 @@ struct BitCode
 struct BitWriter
 {
   // user-supplied callback that writes/stores one byte
-  TooJpeg::WRITE_ONE_BYTE output;
+  WRITE_ONE_BYTE output;
   // initialize writer
-  explicit BitWriter(TooJpeg::WRITE_ONE_BYTE output_) : output(output_) {}
+  explicit BitWriter(WRITE_ONE_BYTE output_) : output(output_) {}
 
   // store the most recently encoded bits that are not written yet
   struct BitBuffer
@@ -198,9 +205,9 @@ Number clamp(Number value, Limit minValue, Limit maxValue)
 }
 
 // convert from RGB to YCbCr, constants are similar to ITU-R, see https://en.wikipedia.org/wiki/YCbCr#JPEG_conversion
-float rgb2y (float r, float g, float b) { return +0.299f   * r +0.587f   * g +0.114f   * b; }
-float rgb2cb(float r, float g, float b) { return -0.16874f * r -0.33126f * g +0.5f     * b; }
-float rgb2cr(float r, float g, float b) { return +0.5f     * r -0.41869f * g -0.08131f * b; }
+float rgb2y (int r, int g, int b) { return +0.299f   * static_cast<float>(r) +0.587f   * static_cast<float>(g) +0.114f   * static_cast<float>(b); }
+float rgb2cb(int r, int g, int b) { return -0.16874f * static_cast<float>(r) -0.33126f * static_cast<float>(g) +0.5f     * static_cast<float>(b); }
+float rgb2cr(int r, int g, int b) { return +0.5f     * static_cast<float>(r) -0.41869f * static_cast<float>(g) -0.08131f * static_cast<float>(b); }
 
 // forward DCT computation "in one dimension" (fast AAN algorithm by Arai, Agui and Nakajima: "A fast DCT-SQ scheme for images")
 void DCT(float block[8*8], uint8_t stride) // stride must be 1 (=horizontal) or 8 (=vertical)
@@ -346,15 +353,22 @@ void generateHuffmanTable(const uint8_t numCodes[16], const uint8_t* values, Bit
 namespace TooJpeg
 {
 // the only exported function ...
-bool writeJpeg(WRITE_ONE_BYTE output, const void* pixels_, unsigned short width, unsigned short height,
-               bool isRGB, unsigned char quality_, bool downsample, const char* comment)
+bool saveJpeg(const QString& fileName, const QImage& image,
+              unsigned char quality_, bool downsample, const char* comment)
 {
-  // reject invalid pointers
-  if (output == nullptr || pixels_ == nullptr)
-    return false;
-  // check image format
-  if (width == 0 || height == 0)
-    return false;
+  if (fileName.isEmpty() || image.isNull())
+      return false;
+
+  QFile file(fileName);
+  if (!file.open(QIODevice::WriteOnly))
+      return false;
+
+  QDataStream out(&file);
+
+  const unsigned short width = static_cast<unsigned short>(image.width());
+  const unsigned short height = static_cast<unsigned short>(image.height());
+
+  const bool isRGB = !image.isGrayscale();
 
   // number of components
   const auto numComponents = isRGB ? 3 : 1;
@@ -367,7 +381,7 @@ bool writeJpeg(WRITE_ONE_BYTE output, const void* pixels_, unsigned short width,
     downsample = false;
 
   // wrapper for all output operations
-  BitWriter bitWriter(output);
+  BitWriter bitWriter([&out](unsigned char byte) { out << byte; });
 
   // ////////////////////////////////////////
   // JFIF headers
@@ -540,9 +554,6 @@ bool writeJpeg(WRITE_ONE_BYTE output, const void* pixels_, unsigned short width,
     codewords[+value] = BitCode(       value, numBits);
   }
 
-  // just convert image data from void*
-  auto pixels = (const uint8_t*)pixels_;
-
   // the next two variables are frequently used when checking for image borders
   const auto maxWidth  = width  - 1; // "last row"
   const auto maxHeight = height - 1; // "bottom line"
@@ -569,26 +580,23 @@ bool writeJpeg(WRITE_ONE_BYTE output, const void* pixels_, unsigned short width,
           {
             auto column = minimum(mcuX + blockX         , maxWidth); // must not exceed image borders, replicate last row/column if needed
             auto row    = minimum(mcuY + blockY + deltaY, maxHeight);
-            for (auto deltaX = 0; deltaX < 8; deltaX++)
-            {
-              // find actual pixel position within the current image
-              auto pixelPos = row * int(width) + column; // the cast ensures that we don't run into multiplication overflows
-              if (column < maxWidth)
-                column++;
 
+            const QRgb* rgb = (const QRgb*)image.constScanLine(row);
+            for (auto deltaX = 0; deltaX < 8; deltaX++, column = minimum(column + 1, maxWidth))
+            {
               // grayscale images have solely a Y channel which can be easily derived from the input pixel by shifting it by 128
               if (!isRGB)
               {
-                Y[deltaY][deltaX] = pixels[pixelPos] - 128.f;
+                Y[deltaY][deltaX] = static_cast<float>(qRed(rgb[column]) - 128);
                 continue;
               }
 
               // RGB: 3 bytes per pixel (whereas grayscale images have only 1 byte per pixel)
-              auto r = pixels[3 * pixelPos    ];
-              auto g = pixels[3 * pixelPos + 1];
-              auto b = pixels[3 * pixelPos + 2];
+              auto r = qRed  (rgb[column]);
+              auto g = qGreen(rgb[column]);
+              auto b = qBlue (rgb[column]);
 
-              Y   [deltaY][deltaX] = rgb2y (r, g, b) - 128; // again, the JPEG standard requires Y to be shifted by 128
+              Y   [deltaY][deltaX] = rgb2y (r, g, b) - 128.f; // again, the JPEG standard requires Y to be shifted by 128
               // YCbCr444 is easy - the more complex YCbCr420 has to be computed about 20 lines below in a second pass
               if (!downsample)
               {
@@ -615,37 +623,37 @@ bool writeJpeg(WRITE_ONE_BYTE output, const void* pixels_, unsigned short width,
         {
           auto row      = minimum(mcuY + 2*deltaY, maxHeight); // each deltaX/Y step covers a 2x2 area
           auto column   =         mcuX;                        // column is updated inside next loop
-          auto pixelPos = (row * int(width) + column) * 3;     // numComponents = 3
 
-          // deltas (in bytes) to next row / column, must not exceed image borders
-          auto rowStep    = (row    < maxHeight) ? 3 * int(width) : 0; // always numComponents*width except for bottom    line
-          auto columnStep = (column < maxWidth ) ? 3              : 0; // always numComponents       except for rightmost pixel
+          // deltas (in pixels) to next row / column, must not exceed image borders
+          auto rowStep    = (row    < maxHeight) ? 1 : 0; // always 1 except for bottom    line
+          auto columnStep = (column < maxWidth ) ? 1 : 0; // always 1 except for rightmost pixel
+
+          const QRgb* rgb     = (const QRgb*)image.constScanLine(row);
+          const QRgb* rgbDown = (const QRgb*)image.constScanLine(row + rowStep);
 
           for (short deltaX = 0; deltaX < 8; deltaX++)
           {
             // let's add all four samples (2x2 area)
-            auto right     = pixelPos + columnStep;
-            auto down      = pixelPos +              rowStep;
-            auto downRight = pixelPos + columnStep + rowStep;
+            auto right = column + columnStep;
 
             // note: cast from 8 bits to >8 bits to avoid overflows when adding
-            auto r = short(pixels[pixelPos    ]) + pixels[right    ] + pixels[down    ] + pixels[downRight    ];
-            auto g = short(pixels[pixelPos + 1]) + pixels[right + 1] + pixels[down + 1] + pixels[downRight + 1];
-            auto b = short(pixels[pixelPos + 2]) + pixels[right + 2] + pixels[down + 2] + pixels[downRight + 2];
+            // current + right + down + downRight
+            auto r = qRed  (rgb[column]) + qRed  (rgb[right]) + qRed  (rgbDown[column]) + qRed  (rgbDown[right]);
+            auto g = qGreen(rgb[column]) + qGreen(rgb[right]) + qGreen(rgbDown[column]) + qGreen(rgbDown[right]);
+            auto b = qBlue (rgb[column]) + qBlue (rgb[right]) + qBlue (rgbDown[column]) + qBlue (rgbDown[right]);
 
             // convert to Cb and Cr
             Cb[deltaY][deltaX] = rgb2cb(r, g, b) / 4; // I still have to divide r,g,b by 4 to get their average values
             Cr[deltaY][deltaX] = rgb2cr(r, g, b) / 4; // it's a bit faster if done AFTER CbCr conversion
 
             // step forward to next 2x2 area
-            pixelPos += 2*3; // 2 pixels => 6 bytes (2*numComponents)
-            column   += 2;
+            column += 2;
 
             // reached right border ?
             if (column >= maxWidth)
             {
               columnStep = 0;
-              pixelPos = ((row + 1) * int(width) - 1) * 3; // same as (row * width + maxWidth) * numComponents => current's row last pixel
+              column = maxWidth; // current's row last pixel
             }
           }
         } // end of YCbCr420 code for Cb and Cr
